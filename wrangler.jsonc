@@ -16,7 +16,11 @@
       {
         "name": "IOT",
         "class_name": "DragonWingIoT"
-      }
+      },
+	  {
+		"name": "CHAT",
+		"class_name": "DragonWingChat"
+	  }
     ]
   },
 
@@ -27,6 +31,11 @@
     },
 
     "DragonWingIoT": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    },
+
+    "DragonWingChat": {
       "type": "durable-object",
       "storage": "sqlite"
     }

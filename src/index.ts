@@ -7,6 +7,7 @@ import { DurableObject } from "cloudflare:workers";
 export interface Env {
   GAME: DurableObjectNamespace<DragonWingGame>;
   IOT: DurableObjectNamespace<DragonWingIoT>;
+  CHAT: DurableObjectNamespace<DragonWingChat>;
 }
 
 /* =========================================================
@@ -94,6 +95,12 @@ export type IoTMessage =
       deviceId: string;
       value: boolean;
     };
+
+
+export type ChatMessage = {
+  type: "message";
+  text: string;
+};
 
 /* =========================================================
  * Common Validation Utilities
@@ -204,6 +211,19 @@ function isIoTMessage(
     default:
       return false;
   }
+}
+
+function isChatMessage(
+  value: unknown,
+): value is ChatMessage {
+  if (!isObject(value)) {
+    return false;
+  }
+
+  return (
+    value.type === "message" &&
+    isBoundedString(value.text, MAX_CHAT_LENGTH)
+  );
 }
 
 /* =========================================================
@@ -920,6 +940,20 @@ export class DragonWingIoT
   }
 }
 
+export class DragonWingChat
+  extends RealtimeDurableObject<ChatMessage> {
+
+  protected getServiceName(): string {
+    return "chat";
+  }
+
+  protected validateMessage(
+    value: unknown,
+  ): value is ChatMessage {
+    return isChatMessage(value);
+  }
+}
+
 /* =========================================================
  * Worker Entry Point
  * ========================================================= */
@@ -965,12 +999,22 @@ export default {
       return iot.fetch(request);
     }
 
+    if (url.pathname === "/ws/chat") {
+      const id =
+        env.CHAT.idFromName("main");
+
+      const chat =
+        env.CHAT.get(id);
+
+      return chat.fetch(request);
+    }
+
     /* =====================================================
      * Unsupported Route
      * ===================================================== */
 
     return new Response(
-      "Use /ws/game or /ws/iot",
+      "Use /ws/game, /ws/iot, or /ws/chat",
       {
         status: 404,
       },
