@@ -24,8 +24,7 @@ export class MainDurableObject extends DurableObject<Env> {
   /**
    * 현재 연결된 WebSocket
    *
-   * 이 Map은 메모리 상태입니다.
-   * Hibernation 후에는 constructor에서 복구합니다.
+   * 메모리 상태이므로 Hibernation 후 constructor에서 복구합니다.
    */
   private clients = new Map<string, WebSocket>();
 
@@ -53,7 +52,10 @@ export class MainDurableObject extends DurableObject<Env> {
     );
 
     /**
-     * SQLite 테이블 초기화
+     * 이 Durable Object가 사용하는 SQLite 테이블입니다.
+     *
+     * 각 Durable Object는 자신의 독립적인 SQLite storage를
+     * 가지고 있으므로 서비스별로 데이터가 분리됩니다.
      */
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS events (
@@ -65,9 +67,12 @@ export class MainDurableObject extends DurableObject<Env> {
     `);
   }
 
+  /**
+   * WebSocket 연결
+   */
   async fetch(request: Request): Promise<Response> {
     /**
-     * WebSocket 연결만 허용
+     * WebSocket 연결만 허용합니다.
      */
     if (request.headers.get("Upgrade") !== "websocket") {
       return new Response("WebSocket required", {
@@ -80,24 +85,26 @@ export class MainDurableObject extends DurableObject<Env> {
     const [client, server] = Object.values(pair);
 
     /**
-     * Hibernation 가능한 WebSocket 연결
+     * Hibernation 가능한 WebSocket으로 등록합니다.
      */
     this.ctx.acceptWebSocket(server);
 
     /**
-     * 클라이언트 ID 생성
+     * 새로운 클라이언트 ID 생성
      */
     const clientId = crypto.randomUUID();
 
     /**
-     * WebSocket에 clientId 저장
-     *
-     * Hibernation 후에도 복구할 수 있습니다.
+     * Hibernation 후에도 clientId를 복구할 수 있도록
+     * WebSocket attachment에 저장합니다.
      */
     server.serializeAttachment({
       id: clientId,
     });
 
+    /**
+     * 메모리에도 등록
+     */
     this.clients.set(clientId, server);
 
     /**
@@ -111,7 +118,9 @@ export class MainDurableObject extends DurableObject<Env> {
     );
 
     /**
-     * 현재 연결된 클라이언트 수 전달
+     * 다른 클라이언트들에게 현재 접속자 수 전달
+     *
+     * 새로 접속한 본인은 제외합니다.
      */
     this.broadcast(
       {
@@ -191,7 +200,7 @@ export class MainDurableObject extends DurableObject<Env> {
     const timestamp = Date.now();
 
     /**
-     * JSON 문자열로 변환해서 SQLite에 저장
+     * payload를 JSON 문자열로 변환해서 SQLite에 저장
      */
     const payloadJson = JSON.stringify(payload);
 
@@ -210,7 +219,7 @@ export class MainDurableObject extends DurableObject<Env> {
     );
 
     /**
-     * 다른 클라이언트들에게 실시간 전달
+     * 다른 클라이언트들에게 전달할 메시지
      */
     const message: ServerMessage = {
       type: "data",
@@ -219,11 +228,23 @@ export class MainDurableObject extends DurableObject<Env> {
       timestamp,
     };
 
+    /**
+     * 현재 코드에서는 sender 자신도 받습니다.
+     *
+     * sender를 제외하고 싶다면:
+     *
+     * this.broadcast(
+     *   message,
+     *   this.clients.get(clientId),
+     * );
+     */
     this.broadcast(message);
   }
 
   /**
-   * 모든 클라이언트에게 broadcast
+   * 모든 WebSocket에게 메시지 전달
+   *
+   * except가 있으면 해당 WebSocket은 제외합니다.
    */
   private broadcast(
     data: unknown,
@@ -239,7 +260,9 @@ export class MainDurableObject extends DurableObject<Env> {
       try {
         ws.send(message);
       } catch {
-        // 연결이 끊어진 경우 무시
+        /**
+         * 연결이 끊어진 경우 무시합니다.
+         */
       }
     }
   }
@@ -270,6 +293,9 @@ export class MainDurableObject extends DurableObject<Env> {
 
     this.clients.delete(info.id);
 
+    /**
+     * 남아 있는 클라이언트들에게 현재 접속자 수 전달
+     */
     this.broadcast({
       type: "clients",
       count: this.clients.size,
@@ -279,19 +305,72 @@ export class MainDurableObject extends DurableObject<Env> {
 
 /**
  * Worker
+ *
+ * URL 구조:
+ *
+ *   /ws/game-1
+ *   /ws/iot-1
+ *   /ws/game-2
+ *
+ * 각각 서로 다른 Durable Object를 사용합니다.
  */
 export default {
   async fetch(
     request: Request,
     env: Env,
   ): Promise<Response> {
+    const url = new URL(request.url);
+
     /**
-     * 항상 하나의 Main Durable Object 사용
+     * URL의 첫 번째 path를 확인합니다.
+     *
+     * 예:
+     *
+     * /ws/game-1
+     *
+     * path:
+     * ["ws", "game-1"]
      */
-    const id = env.MAIN.idFromName("main");
+    const parts = url.pathname
+      .split("/")
+      .filter(Boolean);
 
-    const main = env.MAIN.get(id);
+    /**
+     * /ws/{serviceName} 형식만 허용
+     */
+    if (
+      parts.length !== 2 ||
+      parts[0] !== "ws"
+    ) {
+      return new Response(
+        "Use /ws/{serviceName}",
+        {
+          status: 400,
+        },
+      );
+    }
 
-    return main.fetch(request);
+    const serviceName = parts[1];
+
+    /**
+     * 서비스 이름을 Durable Object 이름으로 사용합니다.
+     *
+     * 예:
+     *
+     * game-1 → DO(game-1)
+     * iot-1  → DO(iot-1)
+     * game-2 → DO(game-2)
+     */
+    const id = env.MAIN.idFromName(serviceName);
+
+    /**
+     * 해당 Durable Object 인스턴스를 가져옵니다.
+     */
+    const durableObject = env.MAIN.get(id);
+
+    /**
+     * 요청을 Durable Object에게 전달합니다.
+     */
+    return durableObject.fetch(request);
   },
 };
