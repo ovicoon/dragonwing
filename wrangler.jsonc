@@ -15,8 +15,8 @@
 	"durable_objects": {
 		"bindings": [
 		{
-			"name": "CHAT_ROOM",
-			"class_name": "ChatRoom"
+			"name": "MAIN",
+			"class_name": "MainDurableObject"
 		}
 		]
 	},
@@ -24,7 +24,7 @@
 	"migrations": [
 		{
 		"tag": "v1",
-		"new_sqlite_classes": ["ChatRoom"]
+		"new_sqlite_classes": ["MainDurableObject"]
 		}
 	]
 }
