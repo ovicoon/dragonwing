@@ -1,376 +1,979 @@
 import { DurableObject } from "cloudflare:workers";
 
+/* =========================================================
+ * Environment
+ * ========================================================= */
+
 export interface Env {
-  MAIN: DurableObjectNamespace<MainDurableObject>;
+  GAME: DurableObjectNamespace<DragonWingGame>;
+  IOT: DurableObjectNamespace<DragonWingIoT>;
 }
 
+/* =========================================================
+ * Common Constants
+ * ========================================================= */
+
+const MAX_MESSAGE_BYTES = 16 * 1024;
+const MAX_STATE_BYTES = 256 * 1024;
+
+const MAX_CHAT_LENGTH = 2000;
+const MAX_TARGET_ID_LENGTH = 128;
+const MAX_DEVICE_ID_LENGTH = 128;
+
+/* =========================================================
+ * Common Types
+ * ========================================================= */
+
 type ClientInfo = {
-  id: string;
-};
-
-type ClientMessage = {
-  type: "data";
-  payload: unknown;
-};
-
-type ServerMessage = {
-  type: "data";
   clientId: string;
-  payload: unknown;
-  timestamp: number;
 };
 
-export class MainDurableObject extends DurableObject<Env> {
-  /**
-   * 현재 연결된 WebSocket
-   *
-   * 메모리 상태이므로 Hibernation 후 constructor에서 복구합니다.
-   */
-  private clients = new Map<string, WebSocket>();
+/*
+ * 서비스별 메시지를 저장하는 공통 상태 구조.
+ *
+ * Game이든 IoT든 구조는 동일하다.
+ * payload 타입만 서비스마다 달라진다.
+ */
+type RealtimeState<M> = {
+  lastEvent: {
+    clientId: string;
+    payload: M;
+    timestamp: number;
+  } | null;
+};
 
-  constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env);
+/*
+ * SQLite에서 읽은 row.
+ */
+type StateRow = {
+  payload: string;
+  updated_at: number;
+};
 
-    /**
-     * Hibernation에서 깨어난 경우
-     * 기존 WebSocket들을 다시 등록합니다.
-     */
-    for (const ws of this.ctx.getWebSockets()) {
-      const info = ws.deserializeAttachment() as ClientInfo | null;
+/* =========================================================
+ * Game Message
+ * ========================================================= */
 
-      if (info) {
-        this.clients.set(info.id, ws);
-      }
+/*
+ * sender의 clientId는 메시지에 넣지 않는다.
+ *
+ * 서버가 WebSocket attachment에서 가져온다.
+ */
+export type GameMessage =
+  | {
+      type: "move";
+      x: number;
+      y: number;
     }
+  | {
+      type: "attack";
+      targetId: string;
+    }
+  | {
+      type: "chat";
+      text: string;
+    };
 
-    /**
-     * ping 요청은 Durable Object를 깨우지 않고
-     * 자동으로 pong을 반환합니다.
-     */
-    this.ctx.setWebSocketAutoResponse(
-      new WebSocketRequestResponsePair("ping", "pong"),
-    );
+/* =========================================================
+ * IoT Message
+ * ========================================================= */
 
-    /**
-     * 이 Durable Object가 사용하는 SQLite 테이블입니다.
-     *
-     * 각 Durable Object는 자신의 독립적인 SQLite storage를
-     * 가지고 있으므로 서비스별로 데이터가 분리됩니다.
-     */
-    this.ctx.storage.sql.exec(`
-      CREATE TABLE IF NOT EXISTS events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        client_id TEXT NOT NULL,
-        payload TEXT NOT NULL,
-        timestamp INTEGER NOT NULL
-      )
-    `);
+export type IoTMessage =
+  | {
+      type: "temperature";
+      deviceId: string;
+      value: number;
+    }
+  | {
+      type: "humidity";
+      deviceId: string;
+      value: number;
+    }
+  | {
+      type: "switch";
+      deviceId: string;
+      value: boolean;
+    };
+
+/* =========================================================
+ * Common Validation Utilities
+ * ========================================================= */
+
+function isObject(
+  value: unknown,
+): value is Record<string, unknown> {
+  return (
+    typeof value === "object" &&
+    value !== null
+  );
+}
+
+function isFiniteNumber(
+  value: unknown,
+): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isFinite(value)
+  );
+}
+
+function isBoundedString(
+  value: unknown,
+  maxLength: number,
+): value is string {
+  return (
+    typeof value === "string" &&
+    value.length <= maxLength
+  );
+}
+
+/* =========================================================
+ * Game Message Validation
+ * ========================================================= */
+
+function isGameMessage(
+  value: unknown,
+): value is GameMessage {
+  if (!isObject(value)) {
+    return false;
   }
 
-  /**
-   * WebSocket 연결
+  switch (value.type) {
+    case "move":
+      return (
+        isFiniteNumber(value.x) &&
+        isFiniteNumber(value.y)
+      );
+
+    case "attack":
+      return isBoundedString(
+        value.targetId,
+        MAX_TARGET_ID_LENGTH,
+      );
+
+    case "chat":
+      return isBoundedString(
+        value.text,
+        MAX_CHAT_LENGTH,
+      );
+
+    default:
+      return false;
+  }
+}
+
+/* =========================================================
+ * IoT Message Validation
+ * ========================================================= */
+
+function isIoTMessage(
+  value: unknown,
+): value is IoTMessage {
+  if (!isObject(value)) {
+    return false;
+  }
+
+  switch (value.type) {
+    case "temperature":
+      return (
+        isBoundedString(
+          value.deviceId,
+          MAX_DEVICE_ID_LENGTH,
+        ) &&
+        isFiniteNumber(value.value)
+      );
+
+    case "humidity":
+      return (
+        isBoundedString(
+          value.deviceId,
+          MAX_DEVICE_ID_LENGTH,
+        ) &&
+        isFiniteNumber(value.value)
+      );
+
+    case "switch":
+      return (
+        isBoundedString(
+          value.deviceId,
+          MAX_DEVICE_ID_LENGTH,
+        ) &&
+        typeof value.value === "boolean"
+      );
+
+    default:
+      return false;
+  }
+}
+
+/* =========================================================
+ * WebSocket Message Parser
+ * ========================================================= */
+
+function parseWebSocketMessage(
+  message: string | ArrayBuffer,
+): unknown | null {
+  /*
+   * ArrayBuffer는 decode하기 전에 크기를 검사한다.
    */
-  async fetch(request: Request): Promise<Response> {
-    /**
-     * WebSocket 연결만 허용합니다.
-     */
-    if (request.headers.get("Upgrade") !== "websocket") {
-      return new Response("WebSocket required", {
-        status: 426,
-      });
+  if (message instanceof ArrayBuffer) {
+    if (
+      message.byteLength >
+      MAX_MESSAGE_BYTES
+    ) {
+      return null;
+    }
+  }
+
+  const text =
+    typeof message === "string"
+      ? message
+      : new TextDecoder().decode(message);
+
+  /*
+   * 문자열은 UTF-8 byte 기준으로 제한한다.
+   */
+  const byteLength =
+    new TextEncoder().encode(text).byteLength;
+
+  if (
+    byteLength >
+    MAX_MESSAGE_BYTES
+  ) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+/* =========================================================
+ * Generic Realtime Durable Object
+ *
+ * 모든 서비스의 공통 동작.
+ *
+ * Game / IoT / 앞으로 추가될 다른 서비스도
+ * 이 클래스를 상속한다.
+ *
+ * 차이는:
+ *   - serviceName
+ *   - message type
+ *   - message validator
+ *
+ * 뿐이다.
+ * ========================================================= */
+
+abstract class RealtimeDurableObject<
+  M,
+> extends DurableObject<Env> {
+
+  /*
+   * 현재 연결된 WebSocket 목록.
+   *
+   * 이것은 영속 데이터가 아니다.
+   *
+   * Hibernation 이후 constructor가 실행되면
+   * ctx.getWebSockets() + attachment로 다시 구성한다.
+   */
+  private clients =
+    new Map<string, WebSocket>();
+
+  /*
+   * 현재 서비스 상태.
+   *
+   * 영속 데이터는 SQLite이고,
+   * 이 값은 메모리 캐시다.
+   */
+  private state:
+    RealtimeState<M>;
+
+  /*
+   * SQLite의 마지막 갱신 시간.
+   */
+  private updatedAt =
+    0;
+
+  /*
+   * 서비스가 구현해야 하는 부분.
+   */
+  protected abstract getServiceName(): string;
+
+  protected abstract validateMessage(
+    value: unknown,
+  ): value is M;
+
+  constructor(
+    ctx: DurableObjectState,
+    env: Env,
+  ) {
+    super(ctx, env);
+
+    /* =====================================================
+     * 공통 상태 테이블
+     *
+     * DO는 서비스별로 분리되어 있으므로
+     * 모든 DO에서 같은 테이블 이름을 사용해도 된다.
+     *
+     * 각 DO에는 이 row 하나만 존재한다.
+     * ===================================================== */
+
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS realtime_state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        payload TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `);
+
+    /* =====================================================
+     * Application State Recovery
+     *
+     * DO instance가 새로 생성되어도
+     * SQLite에 저장된 상태를 복구한다.
+     * ===================================================== */
+
+    const row =
+      this.ctx.storage.sql
+        .exec(
+          `
+            SELECT
+              payload,
+              updated_at
+            FROM realtime_state
+            WHERE id = 1
+          `,
+        )
+        .toArray()[0] as
+          | StateRow
+          | undefined;
+
+    if (row !== undefined) {
+      try {
+        const parsed =
+          JSON.parse(row.payload) as
+            RealtimeState<M>;
+
+        if (
+          isObject(parsed) &&
+          (
+            parsed.lastEvent === null ||
+            isObject(parsed.lastEvent)
+          )
+        ) {
+          this.state = parsed;
+          this.updatedAt =
+            Number(row.updated_at);
+        } else {
+          this.state =
+            this.createInitialState();
+        }
+      } catch {
+        /*
+         * 저장 데이터가 잘못되었으면
+         * 빈 상태에서 시작한다.
+         */
+        this.state =
+          this.createInitialState();
+
+        this.updatedAt =
+          0;
+      }
+    } else {
+      this.state =
+        this.createInitialState();
+
+      this.updatedAt =
+        0;
     }
 
-    const pair = new WebSocketPair();
+    /* =====================================================
+     * WebSocket Recovery
+     *
+     * Hibernation 이후 살아 있는 WebSocket을 복구한다.
+     * ===================================================== */
 
-    const [client, server] = Object.values(pair);
+    for (
+      const ws of this.ctx.getWebSockets()
+    ) {
+      const info =
+        ws.deserializeAttachment() as
+          | ClientInfo
+          | null;
 
-    /**
-     * Hibernation 가능한 WebSocket으로 등록합니다.
-     */
-    this.ctx.acceptWebSocket(server);
+      if (
+        info === null ||
+        typeof info.clientId !== "string"
+      ) {
+        continue;
+      }
 
-    /**
-     * 새로운 클라이언트 ID 생성
-     */
-    const clientId = crypto.randomUUID();
+      this.clients.set(
+        info.clientId,
+        ws,
+      );
+    }
 
-    /**
-     * Hibernation 후에도 clientId를 복구할 수 있도록
-     * WebSocket attachment에 저장합니다.
-     */
-    server.serializeAttachment({
-      id: clientId,
-    });
+    /* =====================================================
+     * Automatic Ping / Pong
+     * ===================================================== */
 
-    /**
-     * 메모리에도 등록
-     */
-    this.clients.set(clientId, server);
+    this.ctx.setWebSocketAutoResponse(
+      new WebSocketRequestResponsePair(
+        "ping",
+        "pong",
+      ),
+    );
+  }
 
-    /**
-     * 접속한 클라이언트에게 자신의 ID 전달
-     */
-    server.send(
-      JSON.stringify({
-        type: "connected",
-        clientId,
-      }),
+  /* =======================================================
+   * Initial State
+   * ======================================================= */
+
+  private createInitialState():
+    RealtimeState<M> {
+    return {
+      lastEvent: null,
+    };
+  }
+
+  /* =======================================================
+   * Connection
+   * ======================================================= */
+
+  async fetch(
+    request: Request,
+  ): Promise<Response> {
+
+    if (
+      request.headers
+        .get("Upgrade")
+        ?.toLowerCase() !== "websocket"
+    ) {
+      return new Response(
+        "WebSocket required",
+        {
+          status: 426,
+        },
+      );
+    }
+
+    const pair =
+      new WebSocketPair();
+
+    const client = pair[0];
+    const server = pair[1];
+
+    /* =====================================================
+     * Register WebSocket for Hibernation
+     * ===================================================== */
+
+    this.ctx.acceptWebSocket(
+      server,
+      [this.getServiceName()],
     );
 
-    /**
-     * 다른 클라이언트들에게 현재 접속자 수 전달
-     *
-     * 새로 접속한 본인은 제외합니다.
+    /* =====================================================
+     * Anonymous Connection ID
+     * ===================================================== */
+
+    const clientId =
+      crypto.randomUUID();
+
+    const clientInfo: ClientInfo = {
+      clientId,
+    };
+
+    /*
+     * Hibernation 복구용 attachment.
      */
-    this.broadcast(
-      {
-        type: "clients",
-        count: this.clients.size,
-      },
+    server.serializeAttachment(
+      clientInfo,
+    );
+
+    this.clients.set(
+      clientId,
       server,
     );
 
-    return new Response(null, {
-      status: 101,
-      webSocket: client,
+    /* =====================================================
+     * Connected Event
+     * ===================================================== */
+
+    this.send(
+      server,
+      {
+        type: "connected",
+        service: this.getServiceName(),
+        clientId,
+      },
+    );
+
+    /* =====================================================
+     * Client Count
+     * ===================================================== */
+
+    this.broadcast({
+      type: "clients",
+      service: this.getServiceName(),
+      count: this.clients.size,
     });
+
+    /* =====================================================
+     * Current State
+     *
+     * 새로 접속한 클라이언트는
+     * 현재 서비스 상태를 바로 받는다.
+     * ===================================================== */
+
+    this.send(
+      server,
+      {
+        type: "state",
+        service: this.getServiceName(),
+        state: this.state,
+        updatedAt: this.updatedAt,
+      },
+    );
+
+    return new Response(
+      null,
+      {
+        status: 101,
+        webSocket: client,
+      },
+    );
   }
 
-  /**
-   * 클라이언트 → 서버 메시지
-   */
+  /* =======================================================
+   * WebSocket Message
+   * ======================================================= */
+
   webSocketMessage(
     ws: WebSocket,
     message: string | ArrayBuffer,
-  ) {
-    const info = ws.deserializeAttachment() as ClientInfo | null;
+  ): void {
 
-    if (!info) {
-      return;
-    }
+    /* =====================================================
+     * Sender Identification
+     *
+     * 클라이언트가 보내는 ID를 사용하지 않는다.
+     * 서버가 만든 attachment의 clientId를 사용한다.
+     * ===================================================== */
 
-    const clientId = info.id;
+    const info =
+      ws.deserializeAttachment() as
+        | ClientInfo
+        | null;
 
-    let data: ClientMessage;
-
-    try {
-      const text =
-        typeof message === "string"
-          ? message
-          : new TextDecoder().decode(message);
-
-      data = JSON.parse(text);
-    } catch {
-      ws.send(
-        JSON.stringify({
-          type: "error",
-          message: "Invalid JSON",
-        }),
+    if (
+      info === null ||
+      typeof info.clientId !== "string"
+    ) {
+      this.sendError(
+        ws,
+        "Client information not found",
       );
 
       return;
     }
 
-    /**
-     * 데이터 메시지
-     */
-    if (data.type === "data") {
-      this.handleData(clientId, data.payload);
+    /* =====================================================
+     * Parse
+     * ===================================================== */
+
+    const parsed =
+      parseWebSocketMessage(message);
+
+    if (parsed === null) {
+      this.sendError(
+        ws,
+        "Invalid JSON or message too large",
+      );
+
       return;
     }
 
-    /**
-     * 알 수 없는 메시지
-     */
-    ws.send(
-      JSON.stringify({
-        type: "error",
-        message: "Unknown message type",
-      }),
+    /* =====================================================
+     * Validation
+     * ===================================================== */
+
+    if (
+      !this.validateMessage(parsed)
+    ) {
+      this.sendError(
+        ws,
+        "Invalid message",
+      );
+
+      return;
+    }
+
+    /* =====================================================
+     * Process
+     * ===================================================== */
+
+    this.handleMessage(
+      ws,
+      info.clientId,
+      parsed,
     );
   }
 
-  /**
-   * 실제 데이터 처리
-   */
-  private handleData(
+  /* =======================================================
+   * Common Message Handling
+   * ======================================================= */
+
+  private handleMessage(
+    ws: WebSocket,
     clientId: string,
-    payload: unknown,
-  ) {
-    const timestamp = Date.now();
+    message: M,
+  ): void {
 
-    /**
-     * payload를 JSON 문자열로 변환해서 SQLite에 저장
-     */
-    const payloadJson = JSON.stringify(payload);
+    const timestamp =
+      Date.now();
 
-    this.ctx.storage.sql.exec(
-      `
-      INSERT INTO events (
-        client_id,
-        payload,
-        timestamp
-      )
-      VALUES (?, ?, ?)
-      `,
-      clientId,
-      payloadJson,
-      timestamp,
-    );
+    const nextState:
+      RealtimeState<M> = {
+        lastEvent: {
+          clientId,
+          payload: message,
+          timestamp,
+        },
+      };
 
-    /**
-     * 다른 클라이언트들에게 전달할 메시지
-     */
-    const message: ServerMessage = {
-      type: "data",
-      clientId,
-      payload,
-      timestamp,
-    };
+    /* =====================================================
+     * Serialize State
+     * ===================================================== */
 
-    /**
-     * 현재 코드에서는 sender 자신도 받습니다.
+    let serializedState: string;
+
+    try {
+      serializedState =
+        JSON.stringify(nextState);
+    } catch {
+      this.sendError(
+        ws,
+        "Failed to serialize state",
+      );
+
+      return;
+    }
+
+    /* =====================================================
+     * State Size Limit
+     * ===================================================== */
+
+    const stateBytes =
+      new TextEncoder()
+        .encode(serializedState)
+        .byteLength;
+
+    if (
+      stateBytes >
+      MAX_STATE_BYTES
+    ) {
+      this.sendError(
+        ws,
+        "State is too large",
+      );
+
+      return;
+    }
+
+    /* =====================================================
+     * Persistent State Update
      *
-     * sender를 제외하고 싶다면:
+     * 항상 id = 1만 사용한다.
      *
-     * this.broadcast(
-     *   message,
-     *   this.clients.get(clientId),
-     * );
-     */
-    this.broadcast(message);
+     * 따라서 이벤트가 아무리 많이 들어와도
+     * SQLite row가 계속 증가하지 않는다.
+     * ===================================================== */
+
+    try {
+      this.ctx.storage.sql.exec(
+        `
+          INSERT INTO realtime_state (
+            id,
+            payload,
+            updated_at
+          )
+          VALUES (1, ?, ?)
+
+          ON CONFLICT(id)
+          DO UPDATE SET
+            payload = excluded.payload,
+            updated_at = excluded.updated_at
+        `,
+        serializedState,
+        timestamp,
+      );
+    } catch {
+      this.sendError(
+        ws,
+        "Failed to persist state",
+      );
+
+      return;
+    }
+
+    /* =====================================================
+     * Memory State Update
+     *
+     * SQLite 저장 성공 후에 갱신한다.
+     * ===================================================== */
+
+    this.state =
+      nextState;
+
+    this.updatedAt =
+      timestamp;
+
+    /* =====================================================
+     * Broadcast
+     *
+     * 기존 코드와 같은 개념:
+     *
+     * event =
+     *   sender + payload + timestamp
+     *
+     * 현재 state 자체는 새 접속 시
+     * state 메시지로 전달된다.
+     * ===================================================== */
+
+    this.broadcast({
+      type: "event",
+      service: this.getServiceName(),
+      clientId,
+      payload: message,
+      timestamp,
+    });
   }
 
-  /**
-   * 모든 WebSocket에게 메시지 전달
-   *
-   * except가 있으면 해당 WebSocket은 제외합니다.
-   */
-  private broadcast(
+  /* =======================================================
+   * Broadcast
+   * ======================================================= */
+
+  protected broadcast(
     data: unknown,
     except?: WebSocket,
-  ) {
-    const message = JSON.stringify(data);
+  ): void {
 
-    for (const ws of this.ctx.getWebSockets()) {
+    let serialized: string;
+
+    try {
+      serialized =
+        JSON.stringify(data);
+    } catch {
+      return;
+    }
+
+    const tag =
+      this.getServiceName();
+
+    const sockets =
+      this.ctx.getWebSockets(tag);
+
+    for (const ws of sockets) {
       if (ws === except) {
         continue;
       }
 
       try {
-        ws.send(message);
+        ws.send(serialized);
       } catch {
-        /**
-         * 연결이 끊어진 경우 무시합니다.
+        /*
+         * 실제 close/error는
+         * Cloudflare WebSocket lifecycle에서 처리한다.
          */
       }
     }
   }
 
-  /**
-   * WebSocket 종료
-   */
-  webSocketClose(ws: WebSocket) {
+  /* =======================================================
+   * Send
+   * ======================================================= */
+
+  private send(
+    ws: WebSocket,
+    data: unknown,
+  ): void {
+
+    try {
+      ws.send(
+        JSON.stringify(data),
+      );
+    } catch {
+      // ignore
+    }
+  }
+
+  /* =======================================================
+   * Error
+   * ======================================================= */
+
+  protected sendError(
+    ws: WebSocket,
+    message: string,
+  ): void {
+
+    this.send(
+      ws,
+      {
+        type: "error",
+        service: this.getServiceName(),
+        message,
+      },
+    );
+  }
+
+  /* =======================================================
+   * WebSocket Close
+   * ======================================================= */
+
+  webSocketClose(
+    ws: WebSocket,
+  ): void {
     this.removeClient(ws);
   }
 
-  /**
-   * WebSocket 오류
-   */
-  webSocketError(ws: WebSocket) {
+  /* =======================================================
+   * WebSocket Error
+   * ======================================================= */
+
+  webSocketError(
+    ws: WebSocket,
+  ): void {
     this.removeClient(ws);
   }
 
-  /**
-   * 연결 제거
-   */
-  private removeClient(ws: WebSocket) {
-    const info = ws.deserializeAttachment() as ClientInfo | null;
+  /* =======================================================
+   * Remove Client
+   * ======================================================= */
 
-    if (!info) {
+  private removeClient(
+    ws: WebSocket,
+  ): void {
+
+    const info =
+      ws.deserializeAttachment() as
+        | ClientInfo
+        | null;
+
+    if (info === null) {
       return;
     }
 
-    this.clients.delete(info.id);
+    this.clients.delete(
+      info.clientId,
+    );
 
-    /**
-     * 남아 있는 클라이언트들에게 현재 접속자 수 전달
-     */
     this.broadcast({
       type: "clients",
+      service: this.getServiceName(),
       count: this.clients.size,
     });
   }
 }
 
-/**
- * Worker
+/* =========================================================
+ * Game Durable Object
  *
- * URL 구조:
+ * 동작은 부모 클래스가 모두 처리한다.
+ * Game은 데이터 형식만 정의한다.
+ * ========================================================= */
+
+export class DragonWingGame
+  extends RealtimeDurableObject<GameMessage> {
+
+  protected getServiceName(): string {
+    return "game";
+  }
+
+  protected validateMessage(
+    value: unknown,
+  ): value is GameMessage {
+    return isGameMessage(value);
+  }
+}
+
+/* =========================================================
+ * IoT Durable Object
  *
- *   /ws/game-1
- *   /ws/iot-1
- *   /ws/game-2
- *
- * 각각 서로 다른 Durable Object를 사용합니다.
- */
+ * Game과 동작 방식은 완전히 동일하다.
+ * 데이터 형식만 IoT용으로 다르다.
+ * ========================================================= */
+
+export class DragonWingIoT
+  extends RealtimeDurableObject<IoTMessage> {
+
+  protected getServiceName(): string {
+    return "iot";
+  }
+
+  protected validateMessage(
+    value: unknown,
+  ): value is IoTMessage {
+    return isIoTMessage(value);
+  }
+}
+
+/* =========================================================
+ * Worker Entry Point
+ * ========================================================= */
+
 export default {
   async fetch(
     request: Request,
     env: Env,
   ): Promise<Response> {
-    const url = new URL(request.url);
 
-    /**
-     * URL의 첫 번째 path를 확인합니다.
-     *
-     * 예:
-     *
-     * /ws/game-1
-     *
-     * path:
-     * ["ws", "game-1"]
-     */
-    const parts = url.pathname
-      .split("/")
-      .filter(Boolean);
+    const url =
+      new URL(request.url);
 
-    /**
-     * /ws/{serviceName} 형식만 허용
-     */
+    /* =====================================================
+     * Game Service
+     * ===================================================== */
+
     if (
-      parts.length !== 2 ||
-      parts[0] !== "ws"
+      url.pathname === "/ws/game"
     ) {
-      return new Response(
-        "Use /ws/{serviceName}",
-        {
-          status: 400,
-        },
-      );
+      const id =
+        env.GAME.idFromName("main");
+
+      const game =
+        env.GAME.get(id);
+
+      return game.fetch(request);
     }
 
-    const serviceName = parts[1];
+    /* =====================================================
+     * IoT Service
+     * ===================================================== */
 
-    /**
-     * 서비스 이름을 Durable Object 이름으로 사용합니다.
-     *
-     * 예:
-     *
-     * game-1 → DO(game-1)
-     * iot-1  → DO(iot-1)
-     * game-2 → DO(game-2)
-     */
-    const id = env.MAIN.idFromName(serviceName);
+    if (
+      url.pathname === "/ws/iot"
+    ) {
+      const id =
+        env.IOT.idFromName("main");
 
-    /**
-     * 해당 Durable Object 인스턴스를 가져옵니다.
-     */
-    const durableObject = env.MAIN.get(id);
+      const iot =
+        env.IOT.get(id);
 
-    /**
-     * 요청을 Durable Object에게 전달합니다.
-     */
-    return durableObject.fetch(request);
+      return iot.fetch(request);
+    }
+
+    /* =====================================================
+     * Unsupported Route
+     * ===================================================== */
+
+    return new Response(
+      "Use /ws/game or /ws/iot",
+      {
+        status: 404,
+      },
+    );
   },
 };

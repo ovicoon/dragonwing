@@ -1,30 +1,34 @@
-/**
- * For more details on how to configure Wrangler, refer to:
- * https://developers.cloudflare.com/workers/wrangler/configuration/
- */
 {
-	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "dragonwing",
-	"main": "src/index.ts",
-	"compatibility_date": "2026-10-01",
-	"observability": {
-		"enabled": true
-	},
-	"upload_source_maps": true,
-	
-	"durable_objects": {
-		"bindings": [
-		{
-			"name": "MAIN",
-			"class_name": "MainDurableObject"
-		}
-		]
-	},
+  "$schema": "./node_modules/wrangler/config-schema.json",
 
-	"migrations": [
-		{
-		"tag": "v1",
-		"new_sqlite_classes": ["MainDurableObject"]
-		}
-	]
+  "name": "dragonwing",
+
+  "main": "src/index.ts",
+
+  "compatibility_date": "2026-10-04",
+
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "GAME",
+        "class_name": "DragonWingGame"
+      },
+      {
+        "name": "IOT",
+        "class_name": "DragonWingIoT"
+      }
+    ]
+  },
+
+  "exports": {
+    "DragonWingGame": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    },
+
+    "DragonWingIoT": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  }
 }
